@@ -37,4 +37,5 @@ void mlir::enzyme::registerCoreDialectAutodiffInterfaces(
   enzyme::registerTensorDialectAutoDiffInterface(registry);
   enzyme::registerGPUDialectAutoDiffInterface(registry);
   enzyme::registerEnzymeDialectAutoDiffInterface(registry);
+  enzyme::registerImpulseDialectAutoDiffInterface(registry);
 }
