@@ -46,6 +46,10 @@ set(LLVM_TARGET_DEFINITIONS FuncDerivatives.td)
 enzyme_tablegen(FuncDerivatives.inc -gen-mlir-derivatives)
 add_public_tablegen_target(FuncDerivativesIncGen)
 
+set(LLVM_TARGET_DEFINITIONS ImpulseDerivatives.td)
+enzyme_tablegen(ImpulseDerivatives.inc -gen-mlir-derivatives)
+add_public_tablegen_target(ImpulseDerivativesIncGen)
+
 set(LLVM_TARGET_DEFINITIONS EnzymeDerivatives.td)
 enzyme_tablegen(EnzymeDerivatives.inc -gen-mlir-derivatives)
 add_public_tablegen_target(EnzymeDerivativesIncGen)
@@ -69,6 +73,7 @@ add_mlir_library(
   MathAutoDiffOpInterfaceImpl.cpp
   GPUAutoDiffOpInterfaceImpl.cpp
   EnzymeAutoDiffOpInterfaceImpl.cpp
+  ImpulseAutoDiffOpInterfaceImpl.cpp
   DEPENDS
   MLIRAutoDiffOpInterfaceIncGen
   AffineDerivativesIncGen
@@ -84,6 +89,8 @@ add_mlir_library(
   MemRefDerivativesIncGen
   MathDerivativesIncGen
   EnzymeDerivativesIncGen
+  ImpulseDerivativesIncGen
+  MLIRImpulseOpsIncGen
   MLIREnzymeEnumsIncGen
   LINK_LIBS
   PUBLIC
@@ -96,4 +103,5 @@ add_mlir_library(
   MLIREnzymeAutoDiffInterface
   MLIRIR
   MLIRSCFDialect
-  MLIRLinalgDialect)
+  MLIRLinalgDialect
+  MLIRImpulse)
