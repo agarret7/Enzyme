@@ -1021,9 +1021,10 @@ public:
     if (!selectors.lookup(name)) {
       OpBuilder builder(table.getContext());
       builder.setInsertionPointToEnd(&table.getBody().back());
-      LLVM::ComdatSelectorOp::create(builder, selector.getLoc(), name,
-                                     selector.getComdat(),
-                                     /*sym_visibility=*/nullptr);
+      LLVM::ComdatSelectorOp::create(builder, selector.getLoc(),
+                                     TypeRange{},
+                                     StringAttr::get(builder.getContext(), name),
+                                     selector.getComdat());
     }
     fn.setComdatAttr(
         SymbolRefAttr::get(table.getSymNameAttr(),
