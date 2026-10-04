@@ -21,6 +21,8 @@
 
 MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Enzyme, enzyme,
                                       mlir::enzyme::EnzymeDialect)
+MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(Impulse, impulse,
+                                      mlir::impulse::ImpulseDialect)
 
 void enzymeRegisterPasses(void) {
   mlir::enzyme::registerDifferentiatePass();
@@ -53,6 +55,14 @@ MlirPass enzymeCreateDifferentiatePassWithOptions(MlirStringRef postpasses,
 
 MlirPass enzymeCreateConvertEnzymeToMemRefPass(void) {
   return wrap(mlir::enzyme::createEnzymeOpsToMemRefPass().release());
+}
+
+MlirPass enzymeCreateExpandImpulsePass(void) {
+  return wrap(mlir::enzyme::createExpandImpulsePass().release());
+}
+
+MlirPass enzymeCreateOutlineEnzymeFromRegionPass(void) {
+  return wrap(mlir::enzyme::createOutlineEnzymeFromRegionPass().release());
 }
 
 MlirPass enzymeCreateBatchPass(void) {

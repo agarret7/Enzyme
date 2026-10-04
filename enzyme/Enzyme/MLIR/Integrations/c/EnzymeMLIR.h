@@ -30,6 +30,7 @@ extern "C" {
 //===----------------------------------------------------------------------===//
 
 MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(Enzyme, enzyme);
+MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(Impulse, impulse);
 
 //===----------------------------------------------------------------------===//
 // Activity attribute
@@ -80,6 +81,14 @@ MLIR_CAPI_EXPORTED MlirPass enzymeCreateBatchDiffPass(void);
 /// Create the `--remove-unnecessary-enzyme-ops` pass, which removes dead
 /// `enzyme.*` ops after differentiation.
 MLIR_CAPI_EXPORTED MlirPass enzymeCreateRemoveUnusedEnzymeOpsPass(void);
+
+/// Create the `--expand-impulse` pass, which materializes `impulse.*` ops
+/// (sample, simulate, infer, ...) into inference algorithms such as HMC/NUTS.
+MLIR_CAPI_EXPORTED MlirPass enzymeCreateExpandImpulsePass(void);
+
+/// Create the `--outline-enzyme-regions` pass, which outlines
+/// `enzyme.autodiff_region` ops into functions called by `enzyme.autodiff`.
+MLIR_CAPI_EXPORTED MlirPass enzymeCreateOutlineEnzymeFromRegionPass(void);
 
 //===----------------------------------------------------------------------===//
 // Core AD ops
