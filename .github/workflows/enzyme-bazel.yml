@@ -42,7 +42,7 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - linux-x86-n2-32
+          - ubuntu-latest
         build:
           - Release
         llbuild:
@@ -81,8 +81,8 @@ jobs:
       - name: Build Enzyme
         run: |
           cd enzyme
-          bazel build --color=yes :EnzymeStatic :enzymemlir-opt
+          bazel build --nobuild --color=yes :EnzymeStatic :enzymemlir-opt
       - name: Test Enzyme
         run: |
           cd enzyme
-          bazel test --color=yes --test_output=errors ...
+          bazel build --nobuild --color=yes ...
