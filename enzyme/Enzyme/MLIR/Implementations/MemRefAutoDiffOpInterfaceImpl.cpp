@@ -23,12 +23,24 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/Config/llvm-config.h"
 
 using namespace mlir;
 using namespace mlir::enzyme;
 
 namespace {
 #include "Implementations/MemRefDerivatives.inc"
+
+#if LLVM_VERSION_MAJOR < 24
+// memref.transpose implements ViewLikeOpInterface itself from LLVM 24.
+struct TransposeOpViewInterface
+    : public ViewLikeOpInterface::ExternalModel<TransposeOpViewInterface,
+                                                memref::TransposeOp> {
+  Value getViewSource(Operation *op) const {
+    return cast<memref::TransposeOp>(op).getIn();
+  }
+};
+#endif
 
 struct SubViewOpOffsetInterface
     : public OffsetViewInterface::ExternalModel<SubViewOpOffsetInterface,
@@ -525,6 +537,9 @@ void mlir::enzyme::registerMemRefDialectAutoDiffInterface(
         OffsetViewInterface::Model<memref::ExpandShapeOp>>(*context);
     memref::CollapseShapeOp::attachInterface<
         OffsetViewInterface::Model<memref::CollapseShapeOp>>(*context);
+#if LLVM_VERSION_MAJOR < 24
+    memref::TransposeOp::attachInterface<TransposeOpViewInterface>(*context);
+#endif
     memref::TransposeOp::attachInterface<
         OffsetViewInterface::Model<memref::TransposeOp>>(*context);
     memref::SubViewOp::attachInterface<SubViewOpOffsetInterface>(*context);
