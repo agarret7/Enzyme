@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "mlir/Rewrite/PatternApplicator.h"
@@ -60,6 +61,48 @@ bool isMemrefCacheType(Type type) {
   return false;
 }
 
+// Gradients start at zero, so adjoint bodies are full of `x + 0.0`. Those adds
+// are `fast`, which allows ignoring the sign of zero, so they can go; without
+// them an adjoint keeps the shape of a plain contraction.
+void foldZeroAdds(Region &body) {
+  body.walk([](arith::AddFOp add) {
+    if (!arith::bitEnumContainsAll(add.getFastmath(),
+                                   arith::FastMathFlags::nsz))
+      return;
+    for (auto [zero, other] : {std::pair(add.getRhs(), add.getLhs()),
+                               std::pair(add.getLhs(), add.getRhs())})
+      if (matchPattern(zero, m_AnyZeroFloat())) {
+        add.replaceAllUsesWith(other);
+        add.erase();
+        return;
+      }
+  });
+}
+
+// Splitting leaves inputs that only the other outputs read. Drop them, as long
+// as the remaining operands still determine every loop's extent.
+void eraseUnusedInputs(linalg::GenericOp op, OpBuilder &builder) {
+  Block &body = op.getRegion().front();
+  SmallVector<Attribute> maps(op.getIndexingMaps().getValue());
+  for (int k = op.getInputsMutable().size() - 1; k >= 0; k--) {
+    if (!body.getArgument(k).use_empty())
+      continue;
+    unsigned numDims = cast<AffineMapAttr>(maps[k]).getValue().getNumDims();
+    bool covered = true;
+    for (unsigned d = 0; d < numDims; d++)
+      covered &= llvm::any_of(llvm::enumerate(maps), [&](auto m) {
+        return (int)m.index() != k &&
+               cast<AffineMapAttr>(m.value()).getValue().isFunctionOfDim(d);
+      });
+    if (!covered)
+      continue;
+    op.getInputsMutable().erase(k);
+    body.eraseArgument(k);
+    maps.erase(maps.begin() + k);
+  }
+  op.setIndexingMapsAttr(builder.getArrayAttr(maps));
+}
+
 void processGenericDuplication(Operation *op, OpBuilder &builder, Location loc,
                                int i) {
   auto clonedAdjoint = builder.clone(*op);
@@ -90,6 +133,19 @@ void processGenericDuplication(Operation *op, OpBuilder &builder, Location loc,
   clonedAdjointGenericOp.setIndexingMapsAttr(
       builder.getArrayAttr(indexingMaps));
 
+  // With one output left, any loop its indexing map doesn't use accumulates
+  // into the same element, so it's a reduction.
+  AffineMap outputMap =
+      cast<AffineMapAttr>(indexingMaps[numInputs]).getValue();
+  SmallVector<Attribute> iteratorTypes;
+  for (unsigned d = 0; d < outputMap.getNumDims(); d++)
+    iteratorTypes.push_back(linalg::IteratorTypeAttr::get(
+        builder.getContext(), outputMap.isFunctionOfDim(d)
+                                  ? utils::IteratorType::parallel
+                                  : utils::IteratorType::reduction));
+  clonedAdjointGenericOp.setIteratorTypesAttr(
+      builder.getArrayAttr(iteratorTypes));
+
   auto clonedAddToOp = getAddToOp(clonedAdjointGenericOp);
   auto scope = OpBuilder::InsertionGuard(builder);
 
@@ -97,8 +153,9 @@ void processGenericDuplication(Operation *op, OpBuilder &builder, Location loc,
   auto terminator = linalg::YieldOp::create(builder, loc);
 
   auto operand = clonedAddToOp->getOperand(i);
+  // Only the ith output is left, right after the inputs.
   auto outputOperand =
-      clonedAdjointGenericOp.getRegion().front().getArgument(numInputs + i);
+      clonedAdjointGenericOp.getRegion().front().getArgument(numInputs);
   auto operandType = cast<AutoDiffTypeInterface>(operand.getType());
 
   builder.setInsertionPoint(terminator);
@@ -107,6 +164,8 @@ void processGenericDuplication(Operation *op, OpBuilder &builder, Location loc,
 
   terminator->setOperands({returnValue});
   clonedAddToOp->erase();
+  foldZeroAdds(clonedAdjointGenericOp.getRegion());
+  eraseUnusedInputs(clonedAdjointGenericOp, builder);
 }
 
 struct AddToOpToSplitPass

@@ -88,43 +88,51 @@ struct SimplifyMemrefCachePass
     allocOp.erase();
   }
 
+  // Each adjoint reading `cache` gets an argument of the cached type in place
+  // of the one that popped from it.
+  void retypeAdjointArguments(Value cache, enzyme::CacheType c2) {
+    for (auto user : cache.getUsers()) {
+      auto linalgOp = dyn_cast<enzyme::GenericAdjointOp>(user);
+      if (!linalgOp) {
+        continue;
+      }
+      for (auto &&input : llvm::enumerate(linalgOp.getInputs())) {
+        if (input.value() != cache) {
+          continue;
+        }
+        unsigned inputIndex = (unsigned)input.index();
+        Value inputCacheSSA = linalgOp.getRegion().insertArgument(
+            inputIndex, c2.getType(), input.value().getLoc());
+        Value oldArg = linalgOp.getRegion().getArgument(inputIndex + 1);
+        for (auto user : llvm::make_early_inc_range(oldArg.getUsers())) {
+          auto popOp = dyn_cast<enzyme::PopOp>(user);
+          if (!popOp) {
+            llvm_unreachable("Unknown user");
+          }
+          popOp.replaceAllUsesWith(inputCacheSSA);
+          popOp.erase();
+        }
+
+        // +1 because we inserted an argument above
+        linalgOp.getRegion().eraseArgument(inputIndex + 1);
+      }
+    }
+  }
+
   void handlePopOp(enzyme::PopOp popOp, Type newType, enzyme::CacheType c2) {
     OpBuilder popBuilder(popOp);
     auto newPopOp = enzyme::PopOp::create(popBuilder, popOp.getLoc(), newType,
                                           popOp.getCache());
 
     // TODO: handle all the stuff inside linalg.generic
-    for (auto user : popOp->getUsers()) {
+    // The adjoint reads the popped cache either directly or through a view.
+    retypeAdjointArguments(popOp, c2);
+    for (auto user : llvm::make_early_inc_range(popOp->getUsers())) {
       auto subviewOp = dyn_cast<memref::SubViewOp>(user);
       if (!subviewOp) {
         continue;
       }
-      for (auto user : subviewOp->getUsers()) {
-        auto linalgOp = dyn_cast<enzyme::GenericAdjointOp>(user);
-        if (!linalgOp) {
-          continue;
-        }
-        for (auto &&input : llvm::enumerate(linalgOp.getInputs())) {
-          if (input.value() != subviewOp) {
-            continue;
-          }
-          unsigned inputIndex = (unsigned)input.index();
-          Value inputCacheSSA = linalgOp.getRegion().insertArgument(
-              inputIndex, c2.getType(), input.value().getLoc());
-          Value oldArg = linalgOp.getRegion().getArgument(inputIndex + 1);
-          for (auto user : oldArg.getUsers()) {
-            auto popOp = dyn_cast<enzyme::PopOp>(user);
-            if (!popOp) {
-              llvm_unreachable("Unknown user");
-            }
-            popOp.replaceAllUsesWith(inputCacheSSA);
-            popOp.erase();
-          }
-
-          // +1 because we inserted an argument above
-          linalgOp.getRegion().eraseArgument(inputIndex + 1);
-        }
-      }
+      retypeAdjointArguments(subviewOp, c2);
       // Replace Subview Op
       OpBuilder subviewBuilder(subviewOp);
       auto newSubviewOp = memref::SubViewOp::create(

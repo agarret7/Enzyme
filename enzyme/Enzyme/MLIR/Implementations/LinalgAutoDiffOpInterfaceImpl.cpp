@@ -24,6 +24,9 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 
 #include "mlir/IR/DialectRegistry.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Support/LogicalResult.h"
 #include <functional>
 
@@ -37,24 +40,27 @@ using namespace mlir::enzyme;
 
 namespace {
 
-Value invertMemref(Value inp, OpBuilder &builder, Location loc) {
-  MemRefType iType = cast<MemRefType>(inp.getType());
-  SmallVector<Value> dims;
-  SmallVector<Value> dimSubOnes;
-  SmallVector<Value> strides;
-  Value negOne = arith::ConstantIndexOp::create(builder, loc, -1);
-  int shapeDim = iType.getShape().size();
-  for (int i = 0; i < shapeDim; i++) {
-    Value dim = memref::DimOp::create(builder, loc, inp, i);
-    dims.push_back(dim);
-    auto dimSubOne = arith::AddIOp::create(builder, loc, dim, negOne);
-    dimSubOnes.push_back(dimSubOne);
-    strides.push_back(negOne);
+// Whether `memref` holds the same contents from `op` to the end of the
+// function, so the reverse pass can read it instead of caching it: `op` only
+// reads it, nothing aliases it, and every other write comes earlier in the same
+// block. `op` must sit directly in the function body, since a loop around it
+// could write `memref` again.
+bool unchangedAfter(Value memref, linalg::LinalgOp op) {
+  if (!isa<FunctionOpInterface>(op->getParentOp()))
+    return false;
+  if (llvm::is_contained(op.getDpsInits(), memref))
+    return false;
+  for (Operation *user : memref.getUsers()) {
+    if (user == op.getOperation())
+      continue;
+    if (isa<ViewLikeOpInterface>(user))
+      return false;
+    if (!mightHaveEffect<MemoryEffects::Write>(user, memref))
+      continue;
+    if (user->getBlock() != op->getBlock() || !user->isBeforeInBlock(op))
+      return false;
   }
-  Value view =
-      memref::SubViewOp::create(builder, loc, inp, ValueRange(dimSubOnes),
-                                ValueRange(dims), ValueRange(strides));
-  return view;
+  return true;
 }
 
 SmallVector<AffineMap> getIndexingMapsArray(enzyme::GenericAdjointOp &op) {
@@ -140,9 +146,7 @@ struct GenericOpInterfaceReverse
         continue;
       }
       indexingMaps.push_back(linalgOp.getMatchingIndexingMap(&output));
-      Value out = gutils->invertPointerM(output.get(), builder);
-      Value view = invertMemref(out, builder, op->getLoc());
-      outputs.push_back(view);
+      outputs.push_back(gutils->invertPointerM(output.get(), builder));
     }
 
     for (OpOperand *input : linalgOp.getDpsInputOperands()) {
@@ -150,9 +154,7 @@ struct GenericOpInterfaceReverse
         continue;
       }
       indexingMaps.push_back(linalgOp.getMatchingIndexingMap(input));
-      Value inp = gutils->invertPointerM(input->get(), builder);
-      Value view = invertMemref(inp, builder, op->getLoc());
-      inputs.push_back(view);
+      inputs.push_back(gutils->invertPointerM(input->get(), builder));
     }
 
     ArrayAttr indexingMapsArrayAttr =
@@ -244,17 +246,52 @@ struct GenericOpInterfaceReverse
 
     auto newOpYield = cast<linalg::YieldOp>(
         cast<linalg::GenericOp>(newOp).getBodyRegion().front().getTerminator());
-    for (Value pc : pushCaches) {
-      newOpYield.getValuesMutable().append(pc);
-    }
-
     auto yieldOp = cast<enzyme::AddToOp>(body->getTerminator());
 
     OpBuilder builderAdd(yieldOp);
 
     auto newIndexingMaps = newOp.getIndexingMapsArray();
     auto indexingMapsAdjoint = getIndexingMapsArray(adjoint);
+    Block *newBody = newOp.getBlock();
+    // The hook added one block argument per cache, after the original ones.
+    unsigned firstCacheArg = newBody->getNumArguments() - numCaches;
+    SmallVector<unsigned> readDirectly;
     for (int i = 0; i < numCaches; i++) {
+      builderAdd.setInsertionPoint(adjoint);
+
+      // A cached value that is just an element of an input which nothing
+      // changes afterwards can be read from that input, through the input's
+      // own indexing map, instead of being stored for every iteration.
+      enzyme::PushOp push;
+      for (Operation *user : pushCaches[i].getUsers())
+        if (auto p = dyn_cast<enzyme::PushOp>(user))
+          push = p;
+      auto arg = push ? dyn_cast<BlockArgument>(push.getValue()) : nullptr;
+      if (arg && arg.getOwner() == newBody &&
+          arg.getArgNumber() < newOp.getNumDpsInputs()) {
+        OpOperand *input = linalgOp.getDpsInputOperand(arg.getArgNumber());
+        if (unchangedAfter(input->get(), linalgOp)) {
+          push->erase();
+          pushCaches[i].getDefiningOp()->erase();
+          // The adjoint now receives the element itself, not a cache of it.
+          BlockArgument popArg = body->getArgument(outputs.size() + i);
+          popArg.setType(cast<enzyme::CacheType>(popArg.getType()).getType());
+          for (Operation *user : llvm::make_early_inc_range(popArg.getUsers()))
+            if (auto pop = dyn_cast<enzyme::PopOp>(user)) {
+              pop.getResult().replaceAllUsesWith(popArg);
+              pop->erase();
+            }
+          readDirectly.push_back(firstCacheArg + i);
+          adjoint.getInputsMutable().append(
+              gutils->getNewFromOriginal(input->get()));
+          indexingMapsAdjoint.insert(
+              indexingMapsAdjoint.begin() + numInputsAdjoint + i,
+              linalgOp.getMatchingIndexingMap(input));
+          continue;
+        }
+      }
+
+      newOpYield.getValuesMutable().append(pushCaches[i]);
       Value cacheArg = body->getArgument(outputs.size() + i);
 
       Type ct = cacheArg.getType();
@@ -272,15 +309,15 @@ struct GenericOpInterfaceReverse
       newIndexingMaps.push_back(AffineMap::getMultiDimIdentityMap(
           iterationDomains.size(), cacheBuilder.getContext()));
 
-      builderAdd.setInsertionPoint(adjoint);
       Value retrievedValue = gutils->popCache(cache, builderAdd);
-      retrievedValue = invertMemref(retrievedValue, builderAdd, op->getLoc());
       adjoint.getInputsMutable().append(ValueRange({retrievedValue}));
       indexingMapsAdjoint.insert(
           indexingMapsAdjoint.begin() + numInputsAdjoint + i,
           AffineMap::getMultiDimIdentityMap(iterationDomains.size(),
                                             builderAdd.getContext()));
     }
+    for (unsigned argNumber : llvm::reverse(readDirectly))
+      newBody->eraseArgument(argNumber);
     SmallVector<Attribute> indexingMapsAttr;
     SmallVector<Attribute> indexingMapsAttrAdjoint;
     for (auto &map : newIndexingMaps) {
