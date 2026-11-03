@@ -24,6 +24,7 @@
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
+#include "llvm/Config/llvm-config.h"
 
 using namespace mlir;
 using namespace mlir::enzyme;
@@ -1058,9 +1059,15 @@ public:
     if (!selectors.lookup(name)) {
       OpBuilder builder(table.getContext());
       builder.setInsertionPointToEnd(&table.getBody().back());
+#if LLVM_VERSION_MAJOR >= 24
       LLVM::ComdatSelectorOp::create(builder, selector.getLoc(), name,
                                      selector.getComdat(),
                                      /*sym_visibility=*/nullptr);
+#else
+      LLVM::ComdatSelectorOp::create(
+          builder, selector.getLoc(), TypeRange{},
+          StringAttr::get(builder.getContext(), name), selector.getComdat());
+#endif
     }
     fn.setComdatAttr(
         SymbolRefAttr::get(table.getSymNameAttr(),
