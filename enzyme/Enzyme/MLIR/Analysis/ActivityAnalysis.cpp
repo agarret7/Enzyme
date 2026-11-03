@@ -473,8 +473,23 @@ static Operation *getFunctionFromCall(CallOpInterface iface) {
 constexpr bool EnzymePrintActivity = false;
 
 static bool isReadOnly(Operation *op) {
-  bool hasRecursiveEffects = op->hasTrait<OpTrait::HasRecursiveMemoryEffects>();
-  if (hasRecursiveEffects) {
+  // An op can declare effects of its own as well as having recursive effects
+  // from its regions: linalg ops write their `outs` buffers while their bodies
+  // are pure. Check both, so those writes are not missed.
+  auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op);
+  if (effectInterface) {
+    // Check to see if this op either has no effects, or only allocates/reads
+    // memory.
+    SmallVector<MemoryEffects::EffectInstance, 1> effects;
+    effectInterface.getEffects(effects);
+    if (!llvm::all_of(effects, [](const MemoryEffects::EffectInstance &it) {
+          return isa<MemoryEffects::Read>(it.getEffect());
+        })) {
+      return false;
+    }
+  }
+
+  if (op->hasTrait<OpTrait::HasRecursiveMemoryEffects>()) {
     for (Region &region : op->getRegions()) {
       for (auto &block : region) {
         for (auto &nestedOp : block)
@@ -485,21 +500,7 @@ static bool isReadOnly(Operation *op) {
     return true;
   }
 
-  // If the op has memory effects, try to characterize them to see if the op
-  // is trivially dead here.
-  if (auto effectInterface = dyn_cast<MemoryEffectOpInterface>(op)) {
-    // Check to see if this op either has no effects, or only allocates/reads
-    // memory.
-    SmallVector<MemoryEffects::EffectInstance, 1> effects;
-    effectInterface.getEffects(effects);
-    if (!llvm::all_of(effects, [](const MemoryEffects::EffectInstance &it) {
-          return isa<MemoryEffects::Read>(it.getEffect());
-        })) {
-      return false;
-    }
-    return true;
-  }
-  return false;
+  return static_cast<bool>(effectInterface);
 }
 
 bool mlir::enzyme::ActivityAnalyzer::isReadOnly(Operation *val) {

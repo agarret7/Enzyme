@@ -16,6 +16,7 @@
 #include "Interfaces/AutoDiffTypeInterface.h"
 #include "Interfaces/GradientUtils.h"
 #include "Interfaces/GradientUtilsReverse.h"
+#include "Passes/RemovalUtils.h"
 
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -83,14 +84,13 @@ struct GenericOpInterfaceReverse
 
     // Replace the op by a linalg.generic op if necessary
     IRRewriter rewriter(builder.getContext(), builder.getListener());
+    // generalizeNamedOp creates the generic and replaces the named op itself,
+    // so only the mapping from the original op needs updating.
+    rewriter.setInsertionPoint(newOp);
     auto failiureOrLinalgOp = generalizeNamedOp(rewriter, newOp);
     if (!failed(failiureOrLinalgOp)) {
-      linalg::LinalgOp replacement = failiureOrLinalgOp.value();
-      auto scope = OpBuilder::InsertionGuard(builder);
-      builder.setInsertionPointAfter(newOp);
-      builder.insert(replacement);
-      newOp.erase();
-      newOp = replacement;
+      newOp = failiureOrLinalgOp.value();
+      gutils->originalToNewFnOps[op] = newOp;
     }
 
     auto cacheBuilder = OpBuilder(newOp, builder.getListener());
@@ -167,25 +167,28 @@ struct GenericOpInterfaceReverse
         ValueRange(inputs), indexingMapsArrayAttr, iteratorTypesArrayAttr,
         StringAttr(), StringAttr());
 
-    int numInputs = inputs.size();
-    auto buildFuncReturnOp = [&gutils, numInputs](OpBuilder &builder,
-                                                  Block *oBB) {
-      auto loc = oBB->rbegin()->getLoc();
-      SmallVector<Value> retargs;
-      for (auto arg : oBB->getArguments()) {
-        retargs.push_back(gutils->invertPointerM(arg, builder));
-      }
-      enzyme::AddToOp::create(builder, loc,
-                              ValueRange{retargs}.take_front(numInputs));
-      return;
-    };
-
     Region *newOpRegion = newOp.getBlock()->getParent();
     Region *adjointRegion = &adjoint.getRegion();
     int numInputsAdjoint = adjoint.getInputs().size();
     Location loc = op->getLoc();
     int numCaches = 0;
     SmallVector<Value> pushCaches;
+
+    // The adjoint body's arguments are the cotangents of the active outputs,
+    // then any cached values (inserted by `hook`), then one accumulator per
+    // active input. Create the cotangents and accumulators up front so the
+    // hook inserts at a valid index.
+    Block *oBB = linalgOp.getBlock();
+    Block *body = new Block();
+    adjointRegion->push_back(body);
+    for (OpOperand &output : linalgOp.getDpsInitsMutable())
+      if (!gutils->isConstantValue(output.get()))
+        body->addArgument(linalgOp.getMatchingBlockArgument(&output).getType(),
+                          loc);
+    for (OpOperand *input : linalgOp.getDpsInputOperands())
+      if (!gutils->isConstantValue(input->get()))
+        body->addArgument(linalgOp.getMatchingBlockArgument(input).getType(),
+                          loc);
 
     auto hook = [newOpRegion, adjointRegion, loc, &numCaches = numCaches,
                  numInputsAdjoint, &pushCaches = pushCaches](Type t) {
@@ -200,11 +203,44 @@ struct GenericOpInterfaceReverse
       return std::make_pair(pushCache, popCache);
     };
 
-    auto sub = gutils->Logic.differentiate(
-        gutils, *linalgOp.getBlock()->getParent(), adjoint.getRegion(),
-        buildFuncReturnOp, hook);
-    if (!sub.succeeded())
-      return sub;
+    // Differentiate the body in the style of scf.for's reverse rule: seed the
+    // yielded values' gradients from the cotangent arguments, visit the body
+    // in reverse, then hand each active input's gradient to `enzyme.addTo`,
+    // which accumulates it into that input's shadow.
+    gutils->registerCacheCreatorHook(hook);
+    OpBuilder bodyBuilder(body, body->end());
+    mlir::enzyme::localizeGradients(bodyBuilder, gutils, oBB);
+
+    Operation *oTerm = oBB->getTerminator();
+    unsigned argIdx = 0;
+    for (auto [idx, output] : llvm::enumerate(linalgOp.getDpsInitsMutable())) {
+      if (gutils->isConstantValue(output.get()))
+        continue;
+      Value yielded = oTerm->getOperand(idx);
+      if (!gutils->isConstantValue(yielded))
+        gutils->addToDiffe(yielded, body->getArgument(argIdx), bodyBuilder);
+      argIdx++;
+    }
+
+    bool valid = true;
+    for (auto it = std::next(oBB->rbegin()); it != oBB->rend(); ++it)
+      valid &= gutils->Logic.visitChild(&*it, bodyBuilder, gutils).succeeded();
+    gutils->deregisterCacheCreatorHook(hook);
+    if (!valid)
+      return failure();
+
+    SmallVector<Value> inputGradients;
+    for (OpOperand *input : linalgOp.getDpsInputOperands()) {
+      if (gutils->isConstantValue(input->get()))
+        continue;
+      BlockArgument arg = linalgOp.getMatchingBlockArgument(input);
+      inputGradients.push_back(
+          gutils->isConstantValue(arg)
+              ? cast<AutoDiffTypeInterface>(arg.getType())
+                    .createNullValue(bodyBuilder, loc)
+              : gutils->diffe(arg, bodyBuilder));
+    }
+    enzyme::AddToOp::create(bodyBuilder, loc, inputGradients);
 
     auto newOpYield = cast<linalg::YieldOp>(
         cast<linalg::GenericOp>(newOp).getBodyRegion().front().getTerminator());
@@ -212,11 +248,7 @@ struct GenericOpInterfaceReverse
       newOpYield.getValuesMutable().append(pc);
     }
 
-    Block *body = &(adjoint.getRegion().front());
     auto yieldOp = cast<enzyme::AddToOp>(body->getTerminator());
-    for (auto opOperand : yieldOp.getOperands()) {
-      body->addArgument(opOperand.getType(), opOperand.getLoc());
-    }
 
     OpBuilder builderAdd(yieldOp);
 
@@ -404,11 +436,57 @@ public:
   }
 };
 
+// Describes how data flows through a structured linalg op for activity
+// analysis. Input block arguments are read from the input operands; output
+// block arguments carry the `outs` operand's initial value and, across
+// iterations of a reduction, the previous `linalg.yield`; and each yielded
+// value is written to its `outs` operand (and becomes the result, for tensors).
+template <typename T_>
+struct LinalgOpADDataFlow
+    : public ADDataFlowOpInterface::ExternalModel<LinalgOpADDataFlow<T_>, T_> {
+  SmallVector<Value> getPotentialIncomingValuesRes(Operation *op,
+                                                   OpResult res) const {
+    auto linalgOp = cast<linalg::LinalgOp>(op);
+    unsigned idx = res.getResultNumber();
+    return {linalgOp.getDpsInitOperand(idx)->get(),
+            linalgOp.getBlock()->getTerminator()->getOperand(idx)};
+  }
+
+  SmallVector<Value> getPotentialIncomingValuesArg(Operation *op,
+                                                   BlockArgument arg) const {
+    auto linalgOp = cast<linalg::LinalgOp>(op);
+    unsigned numInputs = linalgOp.getNumDpsInputs();
+    unsigned idx = arg.getArgNumber();
+    if (idx < numInputs)
+      return {linalgOp.getDpsInputOperand(idx)->get()};
+    idx -= numInputs;
+    return {linalgOp.getDpsInitOperand(idx)->get(),
+            linalgOp.getBlock()->getTerminator()->getOperand(idx)};
+  }
+
+  SmallVector<Value> getPotentialTerminatorUsers(Operation *op, Operation *term,
+                                                 Value val) const {
+    auto linalgOp = cast<linalg::LinalgOp>(op);
+    unsigned numInputs = linalgOp.getNumDpsInputs();
+    SmallVector<Value> users;
+    for (auto [idx, yielded] : llvm::enumerate(term->getOperands())) {
+      if (yielded != val)
+        continue;
+      users.push_back(linalgOp.getDpsInitOperand(idx)->get());
+      users.push_back(linalgOp.getBlock()->getArgument(numInputs + idx));
+      if (idx < op->getNumResults())
+        users.push_back(op->getResult(idx));
+    }
+    return users;
+  }
+};
+
 #include "Implementations/LinalgDerivatives.inc"
 } // namespace
 
 template <typename... Ts> void attachAllInterfaces(MLIRContext *context) {
   (Ts::template attachInterface<GenericOpInterfaceReverse<Ts>>(*context), ...);
+  (Ts::template attachInterface<LinalgOpADDataFlow<Ts>>(*context), ...);
 }
 
 void mlir::enzyme::registerLinalgDialectAutoDiffInterface(
