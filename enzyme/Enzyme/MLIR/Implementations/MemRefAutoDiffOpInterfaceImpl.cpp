@@ -30,6 +30,16 @@ using namespace mlir::enzyme;
 namespace {
 #include "Implementations/MemRefDerivatives.inc"
 
+// LOCAL LLVM 23 SHIM, not for upstream: memref.transpose implements
+// ViewLikeOpInterface only from LLVM 24.
+struct TransposeOpViewInterface
+    : public ViewLikeOpInterface::ExternalModel<TransposeOpViewInterface,
+                                                memref::TransposeOp> {
+  Value getViewSource(Operation *op) const {
+    return cast<memref::TransposeOp>(op).getIn();
+  }
+};
+
 struct SubViewOpOffsetInterface
     : public OffsetViewInterface::ExternalModel<SubViewOpOffsetInterface,
                                                 memref::SubViewOp> {
@@ -525,6 +535,7 @@ void mlir::enzyme::registerMemRefDialectAutoDiffInterface(
         OffsetViewInterface::Model<memref::ExpandShapeOp>>(*context);
     memref::CollapseShapeOp::attachInterface<
         OffsetViewInterface::Model<memref::CollapseShapeOp>>(*context);
+    memref::TransposeOp::attachInterface<TransposeOpViewInterface>(*context);
     memref::TransposeOp::attachInterface<
         OffsetViewInterface::Model<memref::TransposeOp>>(*context);
     memref::SubViewOp::attachInterface<SubViewOpOffsetInterface>(*context);
