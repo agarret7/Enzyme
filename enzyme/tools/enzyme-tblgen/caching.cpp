@@ -294,6 +294,8 @@ os
     os
 << "      auto *len1 = load_if_ref(BuilderZ, intType, M, byRef);\n"
 << "      auto *len2 = load_if_ref(BuilderZ, intType, N, byRef);\n"
+<< "      // M x N in the matrix's layout; a row-major copy is contiguous along N.\n"
+<< "      Value *rowMajor = is_row_major(BuilderZ, " << (typeMap.lookup(0) == ArgType::cblas_layout ? "arg_" + nameVec[0] : std::string("nullptr")) << ");\n"
 << "      auto *matSize = BuilderZ.CreateMul(len1, len2);\n"
 << "      Instruction *SubZero = nullptr;\n"
 << "      CallInst *malloccall = nullptr;\n"
@@ -312,7 +314,7 @@ os << "      if (byRef) valueTypes[" << len_pos << "] = ValueType::Primal;\n";
     }
 os << "      if (EnzymeLapackCopy) {\n"
 << uplostr
-<< "        SmallVector<Value *, 7> args = {uplo, M, N, arg_" << matName << ", arg_" << ldName << ", malins, M};\n"
+<< "        SmallVector<Value *, 7> args = {uplo, M, N, arg_" << matName << ", arg_" << ldName << ", malins, BuilderZ.CreateSelect(rowMajor, N, M)};\n"
 << "        if (!byRef) {\n"
 << "           args.insert(args.begin(), arg_layout); valueTypes.insert(valueTypes.begin(), ValueType::Primal); }\n"
 << "        else\n"
@@ -321,7 +323,8 @@ os << "      if (EnzymeLapackCopy) {\n"
 << "      } else {\n"
 << "        auto dmemcpy = getOrInsertMemcpyMat(*gutils->oldFunc->getParent(), fpType, cast<PointerType>(malins->getType()), intType, 0, 0);\n"
 << "        Value *len_lda = load_if_ref(BuilderZ, intType, arg_" << ldName << ", byRef);\n"
-<< "        Value *args[5] = {malins, arg_" << matName << ", len1, len2, len_lda};\n"
+<< "        // The copy is column-major: its first length is the contiguous one.\n"
+<< "        Value *args[5] = {malins, arg_" << matName << ", BuilderZ.CreateSelect(rowMajor, len2, len1), BuilderZ.CreateSelect(rowMajor, len1, len2), len_lda};\n"
 << "        if (args[1]->getType()->isIntegerTy())\n"
 << "          args[1] = BuilderZ.CreateIntToPtr(args[1], malins->getType());\n"
 << "        else if (args[1]->getType() != malins->getType())\n"

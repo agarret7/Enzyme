@@ -2644,7 +2644,7 @@ llvm::Value *get_cached_mat_width(llvm::IRBuilder<> &B,
                                   llvm::ArrayRef<llvm::Value *> trans,
                                   llvm::Value *arg_ld, llvm::Value *dim_1,
                                   llvm::Value *dim_2, bool cacheMat, bool byRef,
-                                  bool cublas);
+                                  bool cublas, llvm::Value *layout);
 
 template <typename T>
 static inline void append(llvm::SmallVectorImpl<T> &vec) {}
@@ -2663,6 +2663,9 @@ static inline llvm::SmallVector<llvm::Value *, 1> concat_values(T &&...t) {
 
 llvm::Value *is_normal(llvm::IRBuilder<> &B, llvm::Value *trans, bool byRef,
                        bool cublas);
+/// Whether `layout`, a CBLAS layout argument, is row-major. Calls without one
+/// (Fortran BLAS and cuBLAS) pass null and are column-major.
+llvm::Value *is_row_major(llvm::IRBuilder<> &B, llvm::Value *layout);
 llvm::Value *is_left(llvm::IRBuilder<> &B, llvm::Value *side, bool byRef,
                      bool cublas);
 llvm::Value *is_lower(llvm::IRBuilder<> &B, llvm::Value *uplo, bool byRef,

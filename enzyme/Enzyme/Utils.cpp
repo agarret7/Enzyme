@@ -4880,16 +4880,25 @@ llvm::Value *get_cached_mat_width(llvm::IRBuilder<> &B,
                                   llvm::ArrayRef<llvm::Value *> trans,
                                   llvm::Value *arg_ld, llvm::Value *dim1,
                                   llvm::Value *dim2, bool cacheMat, bool byRef,
-                                  bool cublas) {
+                                  bool cublas, llvm::Value *layout) {
   if (!cacheMat)
     return arg_ld;
 
   assert(trans.size() == 1);
 
-  llvm::Value *width =
-      CreateSelect(B, is_normal(B, trans[0], byRef, cublas), dim2, dim1);
+  // The cache is a compact copy, whose leading dimension is its number of rows
+  // in column-major order and its number of columns in row-major order.
+  llvm::Value *normal = is_normal(B, trans[0], byRef, cublas);
+  llvm::Value *columnMajor = CreateSelect(B, normal, dim2, dim1);
+  llvm::Value *rowMajor = CreateSelect(B, normal, dim1, dim2);
+  return CreateSelect(B, is_row_major(B, layout), rowMajor, columnMajor);
+}
 
-  return width;
+llvm::Value *is_row_major(llvm::IRBuilder<> &B, llvm::Value *layout) {
+  if (!layout)
+    return ConstantInt::getFalse(B.getContext());
+  return B.CreateICmpEQ(
+      layout, ConstantInt::get(layout->getType(), /*CblasRowMajor*/ 101));
 }
 
 llvm::Value *transpose(std::string floatType, llvm::IRBuilder<> &B,
